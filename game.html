@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Star Basket — a tiny game built from one prompt</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    background: #0b1030; color: #f4f1de;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 20px 12px;
+  }
+  h1 { font-size: 1.5rem; margin: 0; letter-spacing: .02em; }
+  h1 .star { color: #ffd23f; }
+  p.how { margin: 0; opacity: .85; font-size: .95rem; text-align: center; }
+  #wrap { position: relative; width: min(800px, 96vw); }
+  canvas {
+    display: block; width: 100%; height: auto; border-radius: 14px;
+    background: linear-gradient(#0b1030, #1b2452 78%, #232c5e);
+    box-shadow: 0 18px 50px rgba(0,0,0,.5);
+    touch-action: none; cursor: pointer;
+  }
+  button {
+    font: inherit; font-weight: 700; border: 0; border-radius: 999px;
+    background: #ffd23f; color: #191419; padding: 10px 26px; cursor: pointer;
+  }
+  button:hover { background: #ffdf6b; }
+  footer { font-size: .85rem; opacity: .7; text-align: center; }
+  footer a { color: #ffd23f; }
+</style>
+</head>
+<body>
+  <h1><span class="star">★</span> Star Basket</h1>
+  <p class="how">Move with your <strong>mouse</strong>, <strong>touch</strong>, or the <strong>← → arrow keys</strong>.
+     Catch falling stars in the basket (+10 each). A missed star costs a life — you have 3 — and breaks your
+     streak; every 5 catches in a row earns a +5 bonus. You have 60 seconds. <strong>Space</strong> starts.</p>
+  <div id="wrap">
+    <canvas id="game" width="800" height="520"></canvas>
+  </div>
+  <button id="startBtn" type="button">▶ Start game</button>
+  <footer>Built by an AI coding agent from a single prompt, for a bounty on
+    <a href="https://make.fun/r/44n6pkpv">make.fun</a>.</footer>
+
+<script>
+"use strict";
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+const GROUND = H - 46;
+
+// Fixed background stars (drawn once per frame from a seeded list).
+const bgStars = [];
+for (let i = 0; i < 90; i++) {
+  bgStars.push({ x: (i * 173) % W, y: (i * 97) % (GROUND - 60), r: (i % 3) * 0.7 + 0.6, tw: i % 7 });
+}
+
+const state = {
+  mode: "ready",            // ready | playing | over
+  basketX: W / 2,
+  basketW: 96,
+  keys: { left: false, right: false },
+  stars: [],
+  score: 0,
+  streak: 0,          // catches in a row without a miss: every 5th earns a bonus
+  bestStreak: 0,
+  lives: 3,
+  timeLeft: 60,
+  elapsed: 0,
+  spawnEvery: 0.62,
+  spawnTimer: 0,
+  lastTs: 0,
+  flash: 0,
+};
+
+function reset() {
+  state.stars = [];
+  state.score = 0;
+  state.streak = 0;
+  state.bestStreak = 0;
+  state.lives = 3;
+  state.timeLeft = 60;
+  state.elapsed = 0;
+  state.spawnTimer = 0;
+  state.flash = 0;
+  state.basketX = W / 2;
+}
+
+function spawnStar() {
+  const r = 13 + Math.random() * 7;
+  state.stars.push({
+    x: r + Math.random() * (W - 2 * r),
+    y: -r,
+    r,
+    vy: 130 + Math.random() * 90 + state.elapsed * 2.2, // speeds up gently
+    sway: Math.random() * Math.PI * 2,
+  });
+}
+
+function drawStar(x, y, r, colour) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rad = i % 2 === 0 ? r : r * 0.45;
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    ctx[i === 0 ? "moveTo" : "lineTo"](Math.cos(a) * rad, Math.sin(a) * rad);
+  }
+  ctx.closePath();
+  ctx.fillStyle = colour;
+  ctx.shadowColor = colour;
+  ctx.shadowBlur = 12;
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawBasket(x) {
+  const w = state.basketW, h = 34, top = GROUND - h;
+  ctx.save();
+  ctx.fillStyle = "#8a5a2b";
+  ctx.beginPath();
+  ctx.moveTo(x - w / 2, top);
+  ctx.lineTo(x + w / 2, top);
+  ctx.lineTo(x + w / 2 - 12, top + h);
+  ctx.lineTo(x - w / 2 + 12, top + h);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = "#a9713a";
+  ctx.fillRect(x - w / 2 - 4, top - 7, w + 8, 10);
+  ctx.strokeStyle = "rgba(0,0,0,.35)";
+  for (let i = 1; i <= 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(x - w / 2 + 6, top + i * 8);
+    ctx.lineTo(x + w / 2 - 6, top + i * 8);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHud() {
+  ctx.fillStyle = "#f4f1de";
+  ctx.font = "700 22px system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("Score: " + state.score, 18, 34);
+  ctx.textAlign = "center";
+  ctx.fillText("⏱ " + Math.ceil(state.timeLeft) + "s", W / 2, 34);
+  ctx.textAlign = "right";
+  ctx.fillText("♥".repeat(Math.max(0, state.lives)) + "♡".repeat(Math.max(0, 3 - state.lives)), W - 18, 34);
+  if (state.streak >= 2 && state.mode === "playing") {
+    ctx.fillStyle = "#ffd23f";
+    ctx.font = "700 17px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("🔥 streak ×" + state.streak, 18, 62);
+  }
+}
+
+function drawScene(now) {
+  ctx.clearRect(0, 0, W, H);
+  for (const s of bgStars) {
+    ctx.globalAlpha = 0.35 + 0.3 * Math.abs(Math.sin(now / 900 + s.tw));
+    ctx.fillStyle = "#cdd6ff";
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // Moon
+  ctx.fillStyle = "#f7ead1";
+  ctx.beginPath(); ctx.arc(W - 84, 76, 26, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#0e1440";
+  ctx.beginPath(); ctx.arc(W - 96, 68, 22, 0, Math.PI * 2); ctx.fill();
+  // Ground
+  ctx.fillStyle = "#232c5e";
+  ctx.fillRect(0, GROUND + 12, W, H - GROUND);
+  for (const st of state.stars) drawStar(st.x, st.y, st.r, "#ffd23f");
+  drawBasket(state.basketX);
+  drawHud();
+  if (state.flash > 0) {
+    ctx.fillStyle = "rgba(255,60,60," + (state.flash * 0.25) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (state.mode === "ready") {
+    centreText("Click Start — catch as many stars as you can!", H / 2);
+  } else if (state.mode === "over") {
+    centreText(state.timeLeft <= 0 ? "Time up!" : "Out of lives!", H / 2 - 26);
+    centreText("Final score: " + state.score + "  ·  best streak ×" + state.bestStreak, H / 2 + 12);
+    centreText("Press Start (or Space) to play again", H / 2 + 50);
+  }
+}
+
+function centreText(text, y) {
+  ctx.save();
+  ctx.font = "700 24px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  const w = ctx.measureText(text).width + 36;
+  ctx.fillStyle = "rgba(5,8,30,.72)";
+  ctx.fillRect(W / 2 - w / 2, y - 32, w, 48);
+  ctx.fillStyle = "#ffd23f";
+  ctx.fillText(text, W / 2, y);
+  ctx.restore();
+}
+
+function step(dt, now) {
+  if (state.mode !== "playing") return;
+  state.elapsed += dt;
+  state.timeLeft = Math.max(0, 60 - state.elapsed);
+  state.flash = Math.max(0, state.flash - dt * 2.4);
+  const speed = 520;
+  if (state.keys.left) state.basketX -= speed * dt;
+  if (state.keys.right) state.basketX += speed * dt;
+  state.basketX = Math.min(W - state.basketW / 2, Math.max(state.basketW / 2, state.basketX));
+
+  state.spawnTimer -= dt;
+  if (state.spawnTimer <= 0) { spawnStar(); state.spawnTimer = state.spawnEvery; }
+
+  const basketTop = GROUND - 34;
+  state.stars = state.stars.filter((st) => {
+    st.y += st.vy * dt;
+    st.x += Math.sin(now / 480 + st.sway) * 14 * dt;
+    if (st.y + st.r >= basketTop && st.y - st.r <= basketTop + 16 &&
+        Math.abs(st.x - state.basketX) <= state.basketW / 2 + st.r * 0.4) {
+      state.score += 10;
+      state.streak += 1;
+      state.bestStreak = Math.max(state.bestStreak, state.streak);
+      if (state.streak % 5 === 0) state.score += 5; // streak bonus
+      return false; // caught
+    }
+    if (st.y - st.r > GROUND + 10) {
+      state.lives -= 1;
+      state.streak = 0;
+      state.flash = 1;
+      return false; // missed
+    }
+    return true;
+  });
+
+  if (state.lives <= 0 || state.timeLeft <= 0) state.mode = "over";
+}
+
+function frame(ts) {
+  const now = ts || 0;
+  const dt = Math.min(0.05, state.lastTs ? (now - state.lastTs) / 1000 : 0);
+  state.lastTs = now;
+  step(dt, now);
+  drawScene(now);
+  requestAnimationFrame(frame);
+}
+
+function pointerX(evt) {
+  const rect = canvas.getBoundingClientRect();
+  const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+  return ((clientX - rect.left) / rect.width) * W;
+}
+canvas.addEventListener("mousemove", (e) => { state.basketX = pointerX(e); });
+canvas.addEventListener("touchmove", (e) => { state.basketX = pointerX(e); e.preventDefault(); }, { passive: false });
+function startGame() {
+  reset();
+  state.mode = "playing";
+}
+window.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowLeft") state.keys.left = true;
+  if (e.key === "ArrowRight") state.keys.right = true;
+  if (e.key === " " && state.mode !== "playing") { startGame(); e.preventDefault(); }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.key === "ArrowLeft") state.keys.left = false;
+  if (e.key === "ArrowRight") state.keys.right = false;
+});
+document.getElementById("startBtn").addEventListener("click", startGame);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
